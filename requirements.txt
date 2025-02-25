@@ -1,0 +1,7 @@
+langchain
+langchain-openai
+langchain-community
+fastapi[standard]
+uvicorn
+httpx
+aiosqlite
