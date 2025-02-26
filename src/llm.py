@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import time
 # logger
 from logging import getLogger
 
@@ -83,14 +85,16 @@ async def init_llm(message: ChatMessage, session_id: str):
 
 async def generate_stream_response(message: ChatMessage, session_id: str):
     """Generate a stream response for the chat message on the fly"""
-
-    # Initialize the LLM, agent, and message history
+    # Create a new instance of the LLM
     agent, chain, config = await init_llm(message, session_id)
 
     # Create a human message from the input
     human_message = HumanMessage(content=message.message)
 
-    # Stream the agent's responses with proper message format
+    # Add a heartbeat to keep the connection alive
+    yield f"data: {json.dumps({'content': ''})}\n\n"
+
+    # Stream directly from the LLM for proper chunking
     async for chunk in chain.astream(human_message, config=config):
         # Handle different types of agent outputs
         content = None
@@ -102,9 +106,26 @@ async def generate_stream_response(message: ChatMessage, session_id: str):
             content = chunk
 
         if content:
-            yield f"data: {json.dumps({'content': content})}\n\n"
+            yield json.dumps(
+                {
+                    "id": f"chatcmpl-{session_id}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": message.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": content},
+                            "logprobs": None,
+                            "finish_reason": None
+                        }
+                    ]
+                }
+            ) + "\n\n"
 
-    # After streaming is complete, save to history
+    # End the stream with a final empty message
+    yield f"data: [DONE]\n\n"
+
     logger.info(f"Completed stream response for session {session_id}")
 
 
@@ -119,20 +140,39 @@ async def generate_complete_response(message: ChatMessage, session_id: str):
     # Get the response from the chain with proper message format
     response = await chain.ainvoke(human_message, config=config)
 
-    # Return the response content (adjust based on actual response format)
-    if isinstance(response, dict) and 'output' in response:
-        return response['output']
-    return response
+    # Extract the content from the response
+    content = response['output'] if isinstance(
+        response, dict) and 'output' in response else response
+
+    # Format it in OpenAI-style JSON structure
+    openai_format_response = {
+        "id": f"chatcmpl-{session_id}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": message.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": "stop"
+            }
+        ]
+    }
+
+    return openai_format_response
 
 
-async def chat_complete(message: ChatMessage, session_id: str) -> JSONResponse | StreamingResponse:
+async def chat_complete(message: ChatMessage, session_id: str):
     """
     Handle chat completion.
-    If streaming is requested, returns a StreamingResponse.
+    If streaming is requested, returns a streaming generator.
     Otherwise, returns a JSONResponse.
     """
     if message.stream:
-        # If it's a streaming response, create and return a StreamingResponse
+        # Return a proper StreamingResponse object wrapping the generator
         return StreamingResponse(
             generate_stream_response(message, session_id),
             media_type="text/event-stream"
